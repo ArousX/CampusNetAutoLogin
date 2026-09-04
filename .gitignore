@@ -1,0 +1,5 @@
+# CampusNetAutoLogin
+credential.bin
+*.log
+*.xml
+*.tmp
