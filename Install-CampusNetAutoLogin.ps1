@@ -12,6 +12,23 @@ $baseDirectory = Join-Path $env:ProgramData 'CampusNetAutoLogin'
 $credentialFile = Join-Path $baseDirectory 'credential.bin'
 $loginFile = Join-Path $baseDirectory 'Login-CampusNet.ps1'
 $taskName = 'CampusNetAutoLoginAtStartup'
+$ncsiPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator'
+$ncsiInternetPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet'
+
+$loginUrl = Read-Host 'Dr.COM login request URL (for example http://172.30.100.2/drcom/login)'
+$parsedLoginUrl = $null
+if (-not [Uri]::TryCreate($loginUrl, [UriKind]::Absolute, [ref]$parsedLoginUrl) -or
+    $parsedLoginUrl.Scheme -notin @('http', 'https') -or
+    [string]::IsNullOrWhiteSpace($parsedLoginUrl.Host)) {
+    throw 'Login URL must be an absolute http or https URL.'
+}
+
+$loginUrl = $parsedLoginUrl.GetLeftPart([UriPartial]::Path)
+$gatewayHost = $parsedLoginUrl.Host
+$gatewayPort = $parsedLoginUrl.Port
+if ($gatewayPort -lt 1) {
+    $gatewayPort = if ($parsedLoginUrl.Scheme -eq 'https') { 443 } else { 80 }
+}
 
 $account = Read-Host 'Campus network account'
 if ([string]::IsNullOrWhiteSpace($account)) { throw 'Account cannot be empty.' }
@@ -37,7 +54,7 @@ function Exit-WithCode([int]$Code) { exit $Code }
 function Test-Gateway([int]$TimeoutMilliseconds) {
     $tcp = [System.Net.Sockets.TcpClient]::new()
     try {
-        $pending = $tcp.BeginConnect('172.30.100.2', 80, $null, $null)
+        $pending = $tcp.BeginConnect('__GATEWAY_HOST__', __GATEWAY_PORT__, $null, $null)
         if (-not $pending.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) { return $false }
         $tcp.EndConnect($pending)
         return $tcp.Connected
@@ -71,7 +88,7 @@ try {
         '{0}={1}' -f $_.Key, [Uri]::EscapeDataString([string]$_.Value)
     }) -join '&'
 
-    $request = [System.Net.HttpWebRequest]::CreateHttp([Uri]::new("http://172.30.100.2/drcom/login?$query"))
+    $request = [System.Net.HttpWebRequest]::CreateHttp([Uri]::new("__LOGIN_URL__?$query"))
     $request.Method = 'GET'
     $request.Proxy = $null
     $request.AllowAutoRedirect = $false
@@ -99,7 +116,8 @@ try {
 finally { $password = $null }
 '@
 
-New-Item -ItemType Directory -Path $baseDirectory -Force | Out-Null
+$loginScript = $loginScript.Replace('__LOGIN_URL__', $loginUrl).Replace('__GATEWAY_HOST__', $gatewayHost).Replace('__GATEWAY_PORT__', [string]$gatewayPort)
+
 Set-Content -LiteralPath $loginFile -Value $loginScript -Encoding ASCII -NoNewline
 
 $secret = [PSCustomObject]@{ Account = $account; Password = $password } | ConvertTo-Json -Compress
@@ -139,6 +157,13 @@ $trigger.Delay = 'PT5S'
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $taskPrincipal -Force | Out-Null
+
+# Disable Windows active network probing so the captive portal does not open a browser.
+New-Item -Path $ncsiPolicyPath -Force | Out-Null
+New-ItemProperty -Path $ncsiPolicyPath -Name 'NoActiveProbe' -PropertyType DWord -Value 1 -Force | Out-Null
+New-Item -Path $ncsiInternetPath -Force | Out-Null
+New-ItemProperty -Path $ncsiInternetPath -Name 'EnableActiveProbing' -PropertyType DWord -Value 0 -Force | Out-Null
+
 Start-ScheduledTask -TaskName $taskName
 
 Write-Host ''
